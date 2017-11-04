@@ -6,9 +6,11 @@
 #include <errno.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/sendfile.h>
 #include <fcntl.h>
 #include <time.h>
+#include <poll.h>
 
 #include "httpd.h"
 #include "defines.h"
@@ -97,6 +99,85 @@ int8_t create_addr(option_t options, struct sockaddr_in *addr) {
   return 0;
 }
 
+size_t rebuild_fds(struct pollfd *fds, client_t *clients) {
+  client_t *head = clients;
+  size_t counter = 0;
+  memset(fds, 0, MAX_CLIENT);
+  while (head && counter < MAX_CLIENT) {
+    fds[counter].fd = head->clientfd;
+    fds[counter].events = POLLIN;
+    fds[counter].revents = 0;
+    head = head->next;
+    ++counter;
+  }
+  return counter;
+}
+
+size_t add_client(struct pollfd *fds, int16_t clientfd,
+  struct sockaddr *client_addr, client_t **clients) {
+  client_t *new = malloc(sizeof (client_t));
+  if (new == NULL) {
+    perror("malloc");
+    return ERROR;
+  }
+  new->client_addr = client_addr;
+  new->clientfd = clientfd;
+  new->next = NULL;
+  if (*clients == NULL) {
+    *clients = new;
+  } else {
+    client_t *last = *clients;
+    while (last->next != NULL) {
+      last = last->next;
+    }
+    last->next = new;
+  }
+  return rebuild_fds(fds, *clients);
+}
+
+size_t delete_client(int16_t clientfd, struct pollfd *fds, client_t **clients) {
+  client_t *node = *clients;
+  client_t *prev = node;
+  while (node && node->clientfd != clientfd) {
+    prev = node;
+    node = node->next;
+  }
+  if (node == NULL) return ERROR;
+  if (*clients == node) {
+    *clients = (*clients)->next;
+  }
+  else prev->next = prev->next->next;
+  // close the file descriptor and destroy the client
+  close(node->clientfd);
+  if (node->client_addr != NULL) {
+    LOG_DEBUG("disconnecting client %s\n",
+      inet_ntoa(((struct sockaddr_in *) node->client_addr)->sin_addr));
+    free(node->client_addr);
+  }
+  free(node);
+  return rebuild_fds(fds, *clients);
+}
+
+void delete_all_clients(client_t **clients) {
+  while (*clients != NULL) {
+    client_t *tmp = (*clients)->next;
+    close((*clients)->clientfd);
+    if ((*clients)->client_addr != NULL) free((*clients)->client_addr);
+    free((*clients));
+    *clients = tmp;
+  }
+}
+
+
+size_t count_clients(client_t *clients) {
+  size_t counter = 0;
+  while (clients) {
+    clients = clients->next;
+    ++counter;
+  }
+  return counter;
+}
+
 int8_t prepare_socket(int16_t socketfd, struct sockaddr_in addr) {
   // Set the address/port associated to that socket reusable
   uint8_t t = 1;
@@ -149,7 +230,10 @@ int8_t parse_request_line(char *request_line, request_t *request) {
     LOG_ERROR("Wrongly formed request line: %s\n", request_line);
     return ERROR;
   }
-  if (preprocess_path(token, tokensize, request) != 0) return ERROR;
+  if (preprocess_path(token, tokensize, request) != 0) {
+    LOG_ERROR("error processing path%s\n", "");
+    return ERROR;
+  }
   // Parse the HTTP version
   tokensize = next_token(&token[tokensize], &token);
   if (tokensize < 0) {
@@ -157,7 +241,7 @@ int8_t parse_request_line(char *request_line, request_t *request) {
     return ERROR;
   }
   if (tokensize == 0) {
-    fprintf(stderr, "Warning: version not provided\n");
+    LOG_WARNING("version not provided%s\n", "");
     return token - request_line;
   }
   for (i = 0; i < NB_VERSION; ++i)
@@ -212,15 +296,17 @@ int32_t parse_request(int8_t clientfd, request_t *request) {
       perror("read");
       return ERROR;
     }
-    if (len == 0) return ERROR;
+    if (len == 0) return FD_CLOSED;
     totallen += len;
   }
   ssize_t bytes_parsed = 0;
   ssize_t total_bytes_parsed = 0;
   if ((bytes_parsed = parse_request_line(buffer, request)) <= 0) return bytes_parsed;
   total_bytes_parsed += bytes_parsed;
-  if ((bytes_parsed = parse_headers(&buffer[bytes_parsed], request)) <= 0) return ERROR;
-  total_bytes_parsed += bytes_parsed;
+  if (total_bytes_parsed < totallen) {
+    if ((bytes_parsed = parse_headers(&buffer[bytes_parsed], request)) < 0) return ERROR;
+    total_bytes_parsed += bytes_parsed;
+  }
   return total_bytes_parsed;
 }
 
@@ -239,15 +325,54 @@ int8_t answer(int8_t clientfd, request_t *request, status_code_e status_code) {
   return 0;
 }
 
-int16_t serve(int16_t socketfd, struct sockaddr *client_addr) {
-  socklen_t socklen = sizeof (struct sockaddr);
-  // Wait for a client to connect
-  int16_t clientfd = accept(socketfd, client_addr, &socklen);
-  if (clientfd < 0) {
-    perror("accept");
-    return ERROR;
+int16_t poll_(struct pollfd *fds, size_t nfds) {
+  int16_t nevents = 0;
+  while (nevents <= 0) {
+    if ((nevents = poll(fds, nfds,-1)) < 0) {
+      perror("poll");
+      return ERROR;
+    }
   }
-  return clientfd;
+  return nevents;
+}
+
+int16_t serve(struct pollfd *fds, client_t *clients) {
+  int16_t clientfd = 0;
+  // We poll already polled clients, no newly created. So the counter has to
+  // initialized here
+  size_t nclients = count_clients(clients);
+  if (fds[SOCKET_INDEX].revents & POLLIN) {
+    struct sockaddr *client_addr = malloc(sizeof (struct sockaddr));
+    if (client_addr == NULL) {
+      perror("malloc");
+      return ERROR;
+    }
+    socklen_t socklen = sizeof (struct sockaddr);
+    // Wait for a client to connect
+    clientfd = accept(fds[SOCKET_INDEX].fd, client_addr, &socklen);
+    if (clientfd < 0) {
+      perror("accept");
+      return ERROR;
+    }
+    add_client(fds, clientfd, client_addr, &clients);
+  }
+  for (size_t i = 0; i < nclients; ++i) {
+    // printf("fd: %i revents: %i %s %s %s\n", fds[i].fd, fds[i].revents,
+    //   fds[i].revents & POLLIN ? "POLLIN" : "",
+    //   fds[i].revents & POLLHUP ? "POLLHUP" : "",
+    //   fds[i].revents & POLLHUP ? "POLLHUP" : "");
+    // TODO: Manage timeout on keep-alive connections
+    if (fds[i].revents & POLLHUP || fds[i].revents & POLLNVAL) {
+      delete_client(fds[i].fd, fds, &clients);
+    } else {
+      if (fds[i].revents & POLLIN) {
+        if (handle(fds[i].fd) != 0) {
+          delete_client(fds[i].fd, fds, &clients);
+        }
+      }
+    }
+  }
+  return 0;
 }
 
 int8_t preprocess_path(char *path, ssize_t pathsize, request_t *request) {
@@ -273,6 +398,7 @@ int8_t sendfile_(int16_t clientfd, request_t *request) {
       answer(clientfd, request, _403);
       return ERROR;
     } else if (errno == ENOENT) {
+      LOG_DEBUG("file %s does not exists\n", request->path);
       answer(clientfd, request, _404);
       return ERROR;
     }
@@ -290,7 +416,7 @@ int8_t sendfile_(int16_t clientfd, request_t *request) {
   time_t t = time(NULL);
   struct tm tm = *localtime(&t);
   ssize_t position = 0;
-  position = snprintf(buffer, BUFFER_SIZE, "HTTP/1.0 200 OK\n");
+  position = snprintf(buffer, BUFFER_SIZE, "HTTP/1.1 200 OK\n");
   position += snprintf(buffer + position,
     BUFFER_SIZE - position,
     "Server: shttpd/%i.%i.%i\n",
@@ -334,7 +460,7 @@ int8_t sendfile_(int16_t clientfd, request_t *request) {
   return 0;
 }
 
-int8_t handle(int8_t clientfd) {
+int8_t handle(int16_t clientfd) {
   request_t request;
   memset(&request, 0, sizeof (request));
   int32_t ret = 0;
@@ -346,6 +472,8 @@ int8_t handle(int8_t clientfd) {
     sendfile_(clientfd, &request);
   } else {
     switch (ret) {
+    case FD_CLOSED:
+      break;
     case ERR_UNKNOWN_METHOD:
       answer(clientfd, &request, _501);
       break;
@@ -353,8 +481,6 @@ int8_t handle(int8_t clientfd) {
       answer(clientfd, &request, _500);
     }
   }
-  // TODO: manage keep-alive
-  close(clientfd);
   free_request(request);
-  return 0;
+  return ret < 0;
 }

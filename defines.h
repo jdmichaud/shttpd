@@ -2,6 +2,7 @@
 #define __DEFINES_H__
 
 #include <stdint.h>
+#include <string.h>
 
 #define VERSION_MAJOR 0
 #define VERSION_MINOR 1
@@ -11,8 +12,11 @@
 #define ERR_NO_SUCH_FILE -2
 #define ERR_ACCESS -3
 #define ERR_UNKNOWN_METHOD -4
+#define FD_CLOSED -5
 #define MAX_PORT_NO 0xFFFF
 #define BUFFER_SIZE 4096
+#define SOCKET_INDEX 0
+#define MAX_CLIENT 1024
 
 /** Some useful macro */
 
@@ -200,5 +204,13 @@ typedef struct {
   char *address;
   uint32_t portno;
 } option_t;
+
+typedef struct client_s {
+  struct sockaddr *client_addr;
+  int16_t clientfd;
+  struct client_s *next;
+} client_t;
+
+extern client_t *g_clients;
 
 #endif // __DEFINES_H__

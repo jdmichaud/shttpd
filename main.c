@@ -9,14 +9,22 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <poll.h>
 
 #include "defines.h"
 #include "httpd.h"
 
-int16_t g_socketfd;
+client_t *g_clients = NULL;
+uint8_t g_running = 1;
 
 void usage(char **argv) {
   fprintf(stderr, "usage: %s ip port\n", argv[0]);
+}
+
+void exit_handler() {
+  LOG_DEBUG("cleaning up...%s\n", "");
+  g_running = 0;
+  delete_all_clients(&g_clients);
 }
 
 // TODO: Manage zip compression
@@ -36,8 +44,11 @@ int main(int argc, char **argv) {
     LOG_ERROR("Invalid port: %s\n", argv[2]);
     return ERROR;
   }
-  g_socketfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (g_socketfd < 0) {
+  atexit(exit_handler);
+  signal(SIGTERM, exit_handler);
+  signal(SIGINT, exit_handler);
+  int16_t socketfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (socketfd < 0) {
     perror("socket");
     return ERROR;
   }
@@ -45,14 +56,16 @@ int main(int argc, char **argv) {
   if (create_addr(options, &addr)) {
     return ERROR;
   }
-  if (prepare_socket(g_socketfd, addr) < 0) return ERROR;
+  if (prepare_socket(socketfd, addr) < 0) return ERROR;
+  struct pollfd fds[MAX_CLIENT];
+  // The socket file descriptor will always be the first one in the list
+  add_client(fds, socketfd, NULL, &g_clients);
   LOG_MSG("listening to %s %u\n", options.address, options.portno);
-  while (1) {
-    struct sockaddr client_addr;
-    int16_t clientfd = serve(g_socketfd, &client_addr);
-    if (clientfd < 0) return ERROR;
-    handle(clientfd);
+  while (g_running) {
+    // TODO: improve performance by keeping count at this level
+    poll_(fds, count_clients(g_clients));
+    serve(fds, g_clients);
   }
-  close(g_socketfd);
+  close(socketfd);
   return 0;
 }
