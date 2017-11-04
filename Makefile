@@ -1,5 +1,7 @@
 all:
 	cc -Wall -Wextra -Wpedantic -Wfatal-errors main.c httpd.c -o shttpd
+debug:
+	cc -Wall -Wextra -Wpedantic -Wfatal-errors -ggdb3 main.c httpd.c -o shttpd
 static:
 	cc -Wall -Wextra -Wpedantic -Wfatal-errors main.c httpd.c -o shttpd -static
 test:
